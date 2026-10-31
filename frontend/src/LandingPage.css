@@ -78,15 +78,13 @@
 @media (max-width: 420px) { .landing-brand b { font-size: 15px; }.landing-nav-cta { gap: 5px; }.landing-hero { padding-right: 19px; padding-left: 19px; }.landing-hero h1 { font-size: 40px; }.landing-hero-art { min-height: 335px; }.hero-glass-card { min-width: 177px; }.hero-glass-card b { font-size: 9px; }.landing-text-button { font-size: 9px; }.landing-proof { font-size: 8px; }.landing-scroll-cue { left: 19px; }.match-signal-grid { grid-template-columns: repeat(2, 1fr); }.reconcile-window { min-height: 373px; }.time-events { gap: 9px; font-size: 5px; }.landing-footer .landing-brand { gap: 7px; } }
 @media (prefers-reduced-motion: reduce) { .landing-page *, .landing-page *::before, .landing-page *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }.landing-reveal { opacity: 1; transform: none; } }
 
-/* One persistent stage carries the model and active feature through the story. */
+/* The model stays pinned beside the chapter decks as the story scrolls. */
 .landing-story-layout { max-width: 1580px; margin: 0 auto; padding: 22px clamp(24px, 4.5vw, 70px) 96px; display: grid; grid-template-columns: minmax(130px, .29fr) minmax(350px, .92fr) minmax(390px, 1fr); align-items: start; gap: clamp(23px, 3.4vw, 52px); position: relative; }
-.revenue-stage { grid-column: 3; grid-row: 1; height: min(820px, calc(100svh - 100px)); min-height: 610px; position: sticky; top: 82px; overflow: visible; isolation: isolate; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
-.revenue-engine-renderer { position: absolute; inset: -4% -9%; z-index: -1; overflow: visible; }
-.revenue-engine-renderer::before { content: ''; position: absolute; inset: 8% 4% auto; height: 52%; border-radius: 50%; background: radial-gradient(ellipse, #e5e2ffb0 0%, #f0efff70 44%, transparent 72%); filter: blur(18px); }
-.revenue-engine-fallback { width: 100%; height: 100%; object-fit: contain; position: absolute; inset: 0; z-index: 0; opacity: .42; filter: saturate(.92) drop-shadow(0 28px 42px #625dd52b); transition: opacity .5s ease; }
-.revenue-engine-renderer.webgl-ready .revenue-engine-fallback { opacity: .08; }
+.revenue-stage { grid-column: 3; grid-row: 1; width: 100%; height: auto; aspect-ratio: 1; max-height: calc(100svh - 150px); min-height: 0; position: sticky; top: 82px; overflow: visible; isolation: isolate; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.revenue-engine-renderer { position: absolute; inset: 0; z-index: -1; overflow: visible; background: transparent; }
+.revenue-engine-fallback { width: 100%; height: 100%; object-fit: contain; position: absolute; inset: 0; z-index: 0; opacity: 1; transition: opacity .35s ease; }
+.revenue-engine-renderer.webgl-ready .revenue-engine-fallback { opacity: 0; }
 .revenue-engine-canvas { width: 100%; height: 100%; display: block; position: absolute; inset: 0; z-index: 0; }
-.revenue-engine-vignette { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 42%, transparent 42%, #fcfdff24 75%, #fcfdff6b 100%); }
 .chapter-visual { width: min(100%, 490px); min-width: 0; display: grid; place-items: center; perspective: 1000px; }
 .chapter-visual .visual-window { width: min(100%, 490px); transform: none; border-color: #ffffffd6; background: linear-gradient(145deg, #ffffffd9 0%, #ffffffb8 43%, #f8f9ffd1 100%); backdrop-filter: blur(24px) saturate(1.48); -webkit-backdrop-filter: blur(24px) saturate(1.48); box-shadow: 0 35px 90px #34315b21, 0 12px 30px #53529913, inset 0 1.5px #fff, inset 0 0 0 1px #ffffff70; }
 .chapter-visual .visual-window::before { content: ''; height: 1px; position: absolute; z-index: 3; top: 0; left: 7%; right: 7%; background: linear-gradient(90deg, transparent, #ffffff, #ffffffdd, transparent); pointer-events: none; }
@@ -155,7 +153,7 @@
   .story-rail-items::-webkit-scrollbar { display: none; }
   .story-rail-items button { min-width: max-content; min-height: 36px; padding: 0 10px; grid-template-columns: auto auto; gap: 7px; }
   .story-rail-items button b { max-width: 130px; white-space: nowrap; }
-  .revenue-stage { grid-column: 2; grid-row: 2; top: 110px; height: min(720px, calc(100svh - 126px)); min-height: 510px; }
+  .revenue-stage { grid-column: 2; grid-row: 2; top: 110px; width: 100%; height: auto; aspect-ratio: 1; max-height: calc(100svh - 150px); min-height: 0; }
   .story-narrative { grid-column: 1; grid-row: 2; }
   .landing-hero { min-height: min(750px, calc(100svh - 124px)); }
   .landing-hero h1 { font-size: clamp(40px, 4.7vw, 52px); letter-spacing: -3.1px; }
@@ -171,7 +169,7 @@
   .landing-hero-actions { margin-top: 23px; flex-wrap: wrap; gap: 14px 20px; }
   .landing-proof { margin-top: 20px; gap: 14px; }
   .landing-scroll-cue { position: static; margin-top: 32px; padding-left: 0; }
-  .revenue-stage { grid-column: 1; grid-row: 2; top: 64px; width: 100%; height: clamp(310px, 46svh, 390px); min-height: 0; border-radius: 21px; }
+  .revenue-stage { grid-column: 1; grid-row: 2; top: 64px; width: 100%; height: clamp(310px, 46svh, 390px); min-height: 0; aspect-ratio: auto; }
   .revenue-stage-caption { top: 14px; right: 15px; left: 15px; font-size: 8px; }
   .story-rail { grid-column: 1; grid-row: 3; top: calc(64px + clamp(310px, 46svh, 390px)); min-width: 0; padding: 5px 0; display: block; border-bottom: 0; }
   .story-rail-items { gap: 3px; }
