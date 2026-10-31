@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ArrowUpRight, BookOpen, Bot, LoaderCircle, MessageCircle, Send, Sparkles, X } from 'lucide-react'
+import ReactMarkdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import './AssistantWidget.css'
 
 type Page = 'overview' | 'subscriptions' | 'billing' | 'payments' | 'catalog' | 'reports'
@@ -13,6 +15,20 @@ const prompts: Record<Page, string[]> = {
   payments: ['How are matches scored?', 'Find recent payments'],
   catalog: ['How do plan rules work?', 'Explain the margin guard'],
   reports: ['Summarize the finance view', 'What is in receivables aging?'],
+}
+
+const markdownComponents: Components = {
+  table: ({ children }) => <div className="guide-table-scroll"><table>{children}</table></div>,
+}
+
+function normalizeAssistantMarkdown(content: string) {
+  return content
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trimStart().startsWith('|') && line.trimEnd().endsWith('|')
+      ? line.replace(/<br\s*\/?>/gi, '; ')
+      : line.replace(/<br\s*\/?>/gi, '  \n'))
+    .join('\n')
 }
 
 export default function AssistantWidget({ page, focusNumber }: { page: Page; focusNumber: string }) {
@@ -62,7 +78,7 @@ export default function AssistantWidget({ page, focusNumber }: { page: Page; foc
       <div className="guide-widget-context"><BookOpen size={13} /><span>Grounded in your product guide and visible workspace</span></div>
       <div className="guide-widget-transcript" ref={transcriptRef} aria-live="polite">
         {!messages.length && <div className="guide-welcome"><span className="guide-welcome-icon"><Sparkles size={19} /></span><b>What can I help you find?</b><p>Ask how a workflow works or look up information available to your role.</p><div className="guide-starters">{prompts[page].map((prompt) => <button key={prompt} onClick={() => void send(prompt)}>{prompt}<ArrowUpRight size={12} /></button>)}</div></div>}
-        {messages.map((message) => <article className={`guide-bubble guide-bubble-${message.role}`} key={message.id}><div className="guide-bubble-copy">{message.content}</div>{Boolean(message.sources?.length) && <div className="guide-source-list"><span>Sources</span>{message.sources?.map((source) => <span className="guide-source-chip" key={source}>{source}</span>)}</div>}</article>)}
+        {messages.map((message) => <article className={`guide-bubble guide-bubble-${message.role}`} key={message.id}><div className={`guide-bubble-copy${message.role === 'assistant' ? ' guide-markdown' : ''}`}>{message.role === 'assistant' ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{normalizeAssistantMarkdown(message.content)}</ReactMarkdown> : message.content}</div>{Boolean(message.sources?.length) && <div className="guide-source-list"><span>Sources</span>{message.sources?.map((source) => <span className="guide-source-chip" key={source}>{source}</span>)}</div>}</article>)}
         {sending && <div className="guide-thinking"><span><i /><i /><i /></span><small>Checking the workspace…</small></div>}
         {error && <div className="guide-error" role="alert">{error}</div>}
       </div>
