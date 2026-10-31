@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import csv
+from html import unescape
 import io
 import os
 import re
@@ -27,8 +28,8 @@ from .models import (
     Subscription, SubscriptionLine, SystemSetting, TaxRule, User, UserSession,
 )
 from .schemas import (
-    AddonToggleIn, DemoLoginIn, DiscountCreateIn, ForgotPasswordIn, FromTemplateIn,
-    LoginIn, PaymentCreateIn, ReconciliationImportIn, PlanCreateIn, ProductCreateIn, ResetPasswordIn,
+    AddonConfirmIn, AddonToggleIn, DemoLoginIn, DiscountCreateIn, ForgotPasswordIn, FromTemplateIn,
+    LoginIn, PaymentCreateIn, ReconciliationBatchConfirmIn, ReconciliationImportIn, PlanCreateIn, ProductCreateIn, ResetPasswordIn,
     SignupIn, StaffCreateIn, SubscriptionCreateIn, TaxCreateIn, TemplateCreateIn,
     TimeAdvanceIn, TransitionIn,
 )
@@ -37,6 +38,7 @@ from .services import (
     add_interval, clock_date, enqueue, generate_invoice, payment_terms_days,
     record_event, round_ratio_half_up, seed_database, set_clock,
 )
+from .assistant_agent import AssistantChatIn, run_assistant
 
 
 app = FastAPI(title="Brightloop OS API", version="0.1.0", description="Subscription lifecycle and recurring billing demo API")
@@ -331,6 +333,12 @@ def whoami(user: User = Depends(get_current_user)):
     return {"user": user_data(user)}
 
 
+@app.post("/api/assistant/chat")
+async def assistant_chat(payload: AssistantChatIn, actor: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Answer from the signed-in user's Brightloop guide and visible workspace records."""
+    return await run_assistant(payload, actor, db)
+
+
 @app.post("/api/auth/forgot-password")
 def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
     user = _user_by_email(db, payload.email)
@@ -582,8 +590,7 @@ def transition_subscription(subscription_id: int, payload: TransitionIn, actor: 
     return _subscription_data(db, sub, actor)
 
 
-@app.post("/api/subscriptions/{subscription_id}/addons/toggle")
-def toggle_addon(subscription_id: int, payload: AddonToggleIn, actor: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def _addon_change_snapshot(subscription_id: int, payload: AddonToggleIn, actor: User, db: Session):
     sub = db.scalar(select(Subscription).options(selectinload(Subscription.lines)).where(Subscription.id == subscription_id))
     if not sub or actor.role == "CUSTOMER" and sub.customer_id != actor.id:
         raise HTTPException(404, "Subscription not found.")
@@ -593,9 +600,11 @@ def toggle_addon(subscription_id: int, payload: AddonToggleIn, actor: User = Dep
     if today < sub.start_date:
         raise HTTPException(409, "This subscription has not started yet.")
     product = db.get(Product, payload.product_id)
-    if not product or product.product_type != "ADDON":
+    if not product or not product.is_active or product.product_type != "ADDON":
         raise HTTPException(422, "Choose an active add-on product.")
     plan = db.get(Plan, sub.plan_id)
+    if not plan:
+        raise HTTPException(409, "The subscription plan is unavailable.")
     cycle_end = sub.next_billing_date
     if cycle_end > today:
         cycle_start = _previous_interval(cycle_end, plan.billing_interval, sub.billing_anchor_day)
@@ -610,8 +619,31 @@ def toggle_addon(subscription_id: int, payload: AddonToggleIn, actor: User = Dep
     line = next((item for item in sub.lines if item.product_id == product.id and item.is_addon), None)
     current_quantity = line.quantity if line and line.is_active else 0
     quantity_delta = payload.quantity - current_quantity
+    if quantity_delta == 0:
+        raise HTTPException(422, "Choose a different add-on quantity to preview a change.")
     amount_delta = round_ratio_half_up(product.sales_price_cents * abs(quantity_delta) * remaining_days, total_days * 10000)
     prorated = amount_delta if quantity_delta > 0 else -amount_delta if quantity_delta < 0 else 0
+    return sub, product, line, {
+        "product_id": product.id, "product_name": product.name, "quantity": payload.quantity,
+        "current_quantity": current_quantity, "proration_cents": prorated,
+        "pending_proration_cents": sum(item.pending_proration_cents for item in sub.lines) + prorated,
+        "remaining_days": remaining_days, "cycle_days": total_days,
+        "next_billing_date": sub.next_billing_date.isoformat(), "effective_date": today.isoformat(),
+    }
+
+
+@app.post("/api/subscriptions/{subscription_id}/addons/preview")
+def preview_addon(subscription_id: int, payload: AddonToggleIn, actor: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _, _, _, preview = _addon_change_snapshot(subscription_id, payload, actor, db)
+    return preview
+
+
+@app.post("/api/subscriptions/{subscription_id}/addons/confirm")
+def toggle_addon(subscription_id: int, payload: AddonConfirmIn, actor: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    sub, product, line, preview = _addon_change_snapshot(subscription_id, payload, actor, db)
+    if payload.expected_proration_cents != preview["proration_cents"] or payload.expected_current_quantity != preview["current_quantity"] or payload.expected_next_billing_date.isoformat() != preview["next_billing_date"]:
+        raise HTTPException(409, "The add-on pricing changed after your preview. Review the updated amount before confirming.")
+    prorated = preview["proration_cents"]
     if payload.quantity == 0:
         if line:
             line.is_active = False
@@ -626,7 +658,7 @@ def toggle_addon(subscription_id: int, payload: AddonToggleIn, actor: User = Dep
         sub.lines.append(SubscriptionLine(product_id=product.id, quantity=payload.quantity, unit_price_cents=product.sales_price_cents, unit_cost_cents=product.cost_price_cents, tax_rule_id=tax.id if tax else None, tax_rate_basis_points=tax.rate_basis_points if tax else 0, is_addon=True, pending_proration_cents=prorated))
     record_event(db, actor.id, "SUBSCRIPTION", sub.id, "ADDON_UPDATED", f"{product.name}: {payload.quantity}")
     db.commit()
-    return {"subscription": _subscription_data(db, sub, actor), "proration_cents": prorated, "pending_proration_cents": sum(item.pending_proration_cents for item in sub.lines), "remaining_days": remaining_days, "cycle_days": total_days, "next_billing_date": sub.next_billing_date.isoformat(), "effective_date": today.isoformat()}
+    return {"subscription": _subscription_data(db, sub, actor), **preview}
 
 
 @app.get("/api/invoices")
@@ -725,6 +757,42 @@ def _parse_bank_date(value: str) -> date:
     raise ValueError("Use a recognizable date such as YYYY-MM-DD or MM/DD/YYYY.")
 
 
+def _ofx_to_csv(content: str) -> str:
+    """Normalize OFX 1.x SGML or OFX 2 XML statement transactions to the CSV importer shape."""
+    currency = re.search(r"<CURDEF\b[^>]*>\s*([^<\r\n]+)", content, re.IGNORECASE)
+    if currency and currency.group(1).strip().upper() != "USD":
+        raise HTTPException(422, "Brightloop currently reconciles USD bank statements only.")
+    transactions = re.findall(r"<STMTTRN\b[^>]*>(.*?)(?:</STMTTRN\b[^>]*>|(?=<STMTTRN\b|</BANKTRANLIST\b|</OFX\b))", content, re.IGNORECASE | re.DOTALL)
+    if not transactions:
+        raise HTTPException(422, "This OFX file has no bank statement transactions.")
+
+    def field(block: str, *tags: str) -> str:
+        for tag in tags:
+            match = re.search(rf"<{tag}\b[^>]*>\s*([^<\r\n]+)", block, re.IGNORECASE)
+            if match:
+                return unescape(match.group(1).strip())
+        return ""
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["date", "amount", "reference", "payer", "memo"])
+    for block in transactions:
+        raw_date = field(block, "DTPOSTED")
+        date_match = re.search(r"\d{8}", raw_date)
+        transaction_date = raw_date
+        if date_match:
+            try:
+                transaction_date = datetime.strptime(date_match.group(0), "%Y%m%d").date().isoformat()
+            except ValueError:
+                pass
+        amount = field(block, "TRNAMT")
+        reference = field(block, "REFNUM", "CHECKNUM", "FITID")
+        payer = field(block, "NAME")
+        memo = field(block, "MEMO")
+        writer.writerow([transaction_date, amount, reference, payer, memo])
+    return output.getvalue()
+
+
 def _parse_bank_amount(row: dict[str, str], amount_header: str) -> int:
     raw = (row.get(amount_header) or "").strip()
     if not raw:
@@ -773,7 +841,10 @@ def sample_bank_statement(actor: User = Depends(require_roles("ADMIN", "STAFF"))
 @app.post("/api/payments/reconcile/import")
 def import_bank_statement(payload: ReconciliationImportIn, actor: User = Depends(require_roles("ADMIN", "STAFF")), db: Session = Depends(get_db)):
     try:
-        reader = csv.DictReader(io.StringIO(payload.csv_content.lstrip("\ufeff")))
+        source = payload.csv_content
+        if payload.file_format == "OFX" or payload.filename.lower().endswith(".ofx"):
+            source = _ofx_to_csv(source)
+        reader = csv.DictReader(io.StringIO(source.lstrip("\ufeff")))
     except csv.Error as error:
         raise HTTPException(422, f"Could not read the CSV file: {error}") from error
     if not reader.fieldnames:
@@ -885,6 +956,40 @@ def confirm_reconciliation(item_id: int, actor: User = Depends(require_roles("AD
     db.commit()
     db.refresh(item)
     return _reconciliation_item_data(db, item)
+
+
+@app.post("/api/payments/reconcile/batch-confirm")
+def confirm_high_confidence_reconciliation(payload: ReconciliationBatchConfirmIn, actor: User = Depends(require_roles("ADMIN", "STAFF")), db: Session = Depends(get_db)):
+    item_ids = list(dict.fromkeys(payload.item_ids))
+    rows = db.scalars(select(ReconciliationItem).where(ReconciliationItem.id.in_(item_ids))).all()
+    by_id = {item.id: item for item in rows}
+    confirmed: list[ReconciliationItem] = []
+    skipped = len(payload.item_ids) - len(item_ids)
+    for item_id in item_ids:
+        item = by_id.get(item_id)
+        if not item or item.status != "SUGGESTED" or item.match_score < 85 or not item.invoice_id:
+            skipped += 1
+            continue
+        invoice = db.get(Invoice, item.invoice_id)
+        if not invoice or invoice.status != "CONFIRMED" or invoice.amount_due_cents <= 0 or item.amount_cents > invoice.amount_due_cents:
+            skipped += 1
+            continue
+        payment = Payment(reference=f"RECON-{item.id:08d}", invoice_id=invoice.id, customer_id=invoice.customer_id, method="BANK_TRANSFER", amount_cents=item.amount_cents, payment_date=item.transaction_date, note=f"Statement {item.bank_reference or 'row'} · {item.memo}".strip(" ·"), created_at=datetime.utcnow())
+        db.add(payment)
+        invoice.amount_paid_cents += item.amount_cents
+        invoice.amount_due_cents -= item.amount_cents
+        if invoice.amount_due_cents == 0:
+            invoice.status = "PAID"
+        db.flush()
+        item.payment_id = payment.id
+        item.status = "CONFIRMED"
+        record_event(db, actor.id, "RECONCILIATION", item.id, "PAYMENT_CONFIRMED", f"{payment.reference} matched to {invoice.number} for {item.amount_cents} cents.")
+        confirmed.append(item)
+    if confirmed:
+        db.commit()
+        for item in confirmed:
+            db.refresh(item)
+    return {"confirmed_count": len(confirmed), "skipped_count": skipped, "items": [_reconciliation_item_data(db, item) for item in confirmed]}
 
 
 @app.get("/api/finance/summary")

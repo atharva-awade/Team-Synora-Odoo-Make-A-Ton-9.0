@@ -159,11 +159,22 @@ class PaymentCreateIn(BaseModel):
 class ReconciliationImportIn(BaseModel):
     filename: str = Field(min_length=1, max_length=180)
     csv_content: str = Field(min_length=1, max_length=1_000_000)
+    file_format: Literal["CSV", "OFX"] = "CSV"
+
+
+class ReconciliationBatchConfirmIn(BaseModel):
+    item_ids: list[int] = Field(min_length=1, max_length=500)
 
 
 class AddonToggleIn(BaseModel):
     product_id: int
     quantity: int = Field(ge=0)
+
+
+class AddonConfirmIn(AddonToggleIn):
+    expected_proration_cents: int
+    expected_current_quantity: int = Field(ge=0)
+    expected_next_billing_date: date
 
 
 class TimeAdvanceIn(BaseModel):

@@ -4,3 +4,5 @@ SQLAlchemy>=2.0,<3
 alembic>=1.15,<2
 pydantic>=2.10,<3
 email-validator>=2,<3
+httpx>=0.28,<1
+python-dotenv>=1,<2
