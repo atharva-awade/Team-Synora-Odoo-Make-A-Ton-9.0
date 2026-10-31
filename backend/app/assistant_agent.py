@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import date
@@ -88,7 +89,7 @@ TOOLS = [
                     "resource": {"type": "string", "enum": ["subscriptions", "invoices", "payments", "products", "plans", "discounts", "taxes", "templates", "reconciliation", "messages", "audit", "clock"]},
                     "query": {"type": "string", "maxLength": 100},
                     "status": {"type": "string", "maxLength": 24},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Requested record count. Brightloop returns at most eight records."},
                 },
                 "required": ["resource"],
                 "additionalProperties": False,
@@ -310,6 +311,7 @@ async def run_assistant(payload: AssistantChatIn, actor: User, db: Session) -> d
     messages.extend({"role": "user", "content": f"Earlier question (context only): {turn.content.strip()[:MAX_MESSAGE_CHARS]}"} for turn in history if turn.role == "user")
     messages.append({"role": "user", "content": payload.message.strip()[:MAX_MESSAGE_CHARS]})
     sources: list[str] = []
+    lookup_results: list[dict] = []
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(32.0, connect=8.0)) as client:
@@ -346,7 +348,9 @@ async def run_assistant(payload: AssistantChatIn, actor: User, db: Session) -> d
                         except Exception:
                             result = {"error": "I could not retrieve that Brightloop information. Try a narrower question."}
                         sources.extend(str(item) for item in result.get("sources", []))
-                        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(_redact_private_text(result), ensure_ascii=False, default=str)[:12000]})
+                        result = _redact_private_text(result)
+                        lookup_results.append({"tool": name, "data": result})
+                        messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": json.dumps(result, ensure_ascii=False, default=str)[:12000]})
                     tool_rounds += 1
                     continue
                 content = message.get("content")
@@ -354,11 +358,30 @@ async def run_assistant(payload: AssistantChatIn, actor: User, db: Session) -> d
                     return {"reply": content.strip()[:6000], "sources": list(dict.fromkeys(sources))[:8], "model": GROQ_MODEL}
                 break
             else:
-                # Give the model one final answer-only pass after the bounded read-only lookups.
+                # Keep function-call messages out of this pass. GPT-OSS may otherwise repeat a
+                # tool call after the tool budget is exhausted, which Groq rejects without tools.
+                final_messages = [
+                    {
+                        "role": "system",
+                        "content": f"{messages[0]['content']}\n\nThe read-only lookup budget is complete. Do not request or call more tools. Answer from the verified lookup results provided below. If they are insufficient, say what is missing.",
+                    }
+                ]
+                final_messages.extend(
+                    {"role": "user", "content": f"Earlier question for context only: {turn.content.strip()[:MAX_MESSAGE_CHARS]}"}
+                    for turn in history
+                    if turn.role == "user"
+                )
+                final_messages.append({"role": "user", "content": payload.message.strip()[:MAX_MESSAGE_CHARS]})
+                final_messages.append({
+                    "role": "user",
+                    "content": "Verified Brightloop read-only lookup results (JSON):\n"
+                    + json.dumps(lookup_results, ensure_ascii=False, default=str)[:30000]
+                    + "\nAnswer the original question concisely, using only these results.",
+                })
                 response = await client.post(
                     GROQ_URL,
                     headers=headers,
-                    json={"model": GROQ_MODEL, "messages": messages, "temperature": 0.2, "max_completion_tokens": 1100},
+                    json={"model": GROQ_MODEL, "messages": final_messages, "temperature": 0.2, "max_completion_tokens": 1100},
                 )
                 if response.status_code == 429:
                     raise HTTPException(429, "Brightloop Guide is at its provider limit. Please try again shortly.")
