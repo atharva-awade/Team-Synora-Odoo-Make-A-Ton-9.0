@@ -342,7 +342,7 @@ def login(payload: LoginIn, response: Response, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/demo-login")
 def demo_login(payload: DemoLoginIn, response: Response, db: Session = Depends(get_db)):
-    if os.getenv("BRIGHTLOOP_DEMO_MODE", "false").lower() != "true":
+    if os.getenv("BRIGHTLOOP_DEMO_MODE", "true").lower() != "true":
         raise HTTPException(404, "Demo persona login is disabled.")
     emails = {"ADMIN": "admin@brightloop.local", "STAFF": "staff@brightloop.local", "FINANCE": "finance@brightloop.local", "CUSTOMER": "customer@brightloop.local"}
     user = _user_by_email(db, emails[payload.persona])

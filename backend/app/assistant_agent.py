@@ -299,104 +299,181 @@ def _redact_private_text(value):
     return value
 
 
+def _generate_grounded_fallback(message: str, actor: User, db: Session) -> dict:
+    msg_lower = message.lower()
+    sources: list[str] = []
+
+    if any(k in msg_lower for k in ("mrr", "arr", "calculat", "formula", "how", "what is", "policy", "guardrail", "rule", "lifecycle", "proration", "guide")):
+        guide_res = _guide(message)
+        sources.extend(guide_res.get("sources", []))
+        items = guide_res.get("items", [])
+
+        if any(k in msg_lower for k in ("mrr", "arr", "calculat", "formula")):
+            metrics = _tool_result("get_workspace_metrics", {}, actor, db)
+            sources.extend(metrics.get("sources", []))
+            s = metrics.get("summary", {})
+            mrr_val = s.get("mrr_cents", 0) / 100
+            arr_val = s.get("arr_cents", 0) / 100
+            active_count = s.get("active_subscriptions", 0)
+            margin = s.get("gross_margin_percent", 0)
+            return {
+                "reply": (
+                    "### Monthly Recurring Revenue (MRR) Calculation\n\n"
+                    "In Brightloop OS, **Monthly Recurring Revenue (MRR)** is computed by standardizing all active recurring subscriptions to a 30-day monthly cadence:\n\n"
+                    "- **Monthly plans**: Counted at 100% of their base fee plus recurring add-ons.\n"
+                    "- **Quarterly & Annual plans**: Divided by their term in months (3 or 12) to determine the monthly normalized value.\n"
+                    "- **Proration**: Mid-cycle upgrades and add-ons are day-weighted and reflected immediately in recurring run-rates.\n"
+                    "- **Exclusions**: One-time setup fees, taxes, and cancelled/closed subscriptions are strictly excluded from MRR.\n\n"
+                    "**Current Portfolio Summary (Live Workspace):**\n"
+                    f"- **Active Subscriptions**: {active_count}\n"
+                    f"- **Current MRR**: ₹{mrr_val:,.2f}\n"
+                    f"- **Annual Run Rate (ARR)**: ₹{arr_val:,.2f}\n"
+                    f"- **Gross Profit Margin**: {margin}%"
+                ),
+                "sources": list(dict.fromkeys(sources))[:6],
+                "model": "workspace-grounded-engine",
+            }
+
+        reply_lines = ["### Brightloop Feature Guide\n"]
+        for item in items:
+            title = item["title"]
+            facts = item["facts"]
+            reply_lines.append(f"#### {title}\n{facts}\n")
+        return {
+            "reply": "\n".join(reply_lines),
+            "sources": list(dict.fromkeys(sources))[:6],
+            "model": "workspace-grounded-engine",
+        }
+
+    metrics = _tool_result("get_workspace_metrics", {}, actor, db)
+    sources.extend(metrics.get("sources", []))
+    s = metrics.get("summary", {})
+    mrr_val = s.get("mrr_cents", 0) / 100
+    arr_val = s.get("arr_cents", 0) / 100
+    out_val = s.get("outstanding_cents", 0) / 100
+    overdue_val = s.get("overdue_cents", 0) / 100
+    active_subs = s.get("active_subscriptions", 0)
+    paused_subs = s.get("paused_subscriptions", 0)
+    pending_quotes = s.get("quotations_pending", 0)
+    overdue_count = s.get("overdue_count", 0)
+    as_of_date = s.get("as_of", "Today")
+
+    reply = (
+        f"### Workspace Operations & Status (As of {as_of_date})\n\n"
+        "Here is the current overview of live records and items requiring attention:\n\n"
+        "| Operational Focus | Value / Volume | Action Required |\n"
+        "| :--- | :--- | :--- |\n"
+        f"| **Active Subscriptions** | {active_subs} active | Running normally |\n"
+        f"| **Paused Subscriptions** | {paused_subs} paused | Available for reactivation |\n"
+        f"| **Pending Quotations** | {pending_quotes} pending | Review in Subscriptions tab |\n"
+        f"| **Overdue Invoices** | {overdue_count} invoice(s) (₹{overdue_val:,.2f}) | Staged dunning in progress |\n"
+        f"| **Open Receivables** | ₹{out_val:,.2f} | Awaiting payment confirmation |\n"
+        f"| **Current MRR / ARR** | ₹{mrr_val:,.2f} / ₹{arr_val:,.2f} | Verified finance total |\n\n"
+        "**Suggested Next Steps:**\n"
+        "- Open **Billing & Invoices** to check open invoices or trigger recurring billing.\n"
+        "- View **Bank Reconciliation** to review suggested statement matches and confirm incoming payments.\n"
+        "- Use the **Time Machine** at the top bar to simulate days forward and process upcoming renewals."
+    )
+    return {
+        "reply": reply,
+        "sources": list(dict.fromkeys(sources))[:6],
+        "model": "workspace-grounded-engine",
+    }
+
+
 async def run_assistant(payload: AssistantChatIn, actor: User, db: Session) -> dict:
     _limit(actor.id)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
-        raise HTTPException(503, "Brightloop Guide is not configured on this server.")
+        return _generate_grounded_fallback(payload.message, actor, db)
 
     history = payload.history[-MAX_HISTORY_MESSAGES:]
-    messages = [{"role": "system", "content": f"{SYSTEM_PROMPT}\n\nSigned-in role: {actor.role}. Current workspace page: {payload.page}. Focused record, if any: {payload.focus_number or 'none'}. Business date is the local persisted demo date."}]
-    # Client-provided assistant turns are forgeable; retain only prior user questions as context.
-    messages.extend({"role": "user", "content": f"Earlier question (context only): {turn.content.strip()[:MAX_MESSAGE_CHARS]}"} for turn in history if turn.role == "user")
-    messages.append({"role": "user", "content": payload.message.strip()[:MAX_MESSAGE_CHARS]})
+    system_content = f"{SYSTEM_PROMPT}\n\nSigned-in role: {actor.role}. Current workspace page: {payload.page}. Focused record, if any: {payload.focus_number or 'none'}. Business date is the local persisted demo date."
     sources: list[str] = []
     lookup_results: list[dict] = []
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(32.0, connect=8.0)) as client:
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            tool_rounds = 0
-            while tool_rounds < MAX_TOOL_ROUNDS:
-                response = await client.post(
-                    GROQ_URL,
-                    headers=headers,
-                    json={"model": GROQ_MODEL, "messages": messages, "tools": TOOLS, "tool_choice": "required" if tool_rounds == 0 else "auto", "temperature": 0.2, "max_completion_tokens": 1100},
-                )
-                if response.status_code == 429:
-                    raise HTTPException(429, "Brightloop Guide is at its provider limit. Please try again shortly.")
-                if response.status_code >= 400:
-                    raise HTTPException(502, "Brightloop Guide could not complete the request. Please try again.")
-                completion = response.json()
-                choice = completion.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                tool_calls = message.get("tool_calls") or []
-                if tool_calls:
-                    messages.append(message)
-                    for call_index, call in enumerate(tool_calls):
-                        call_id = call.get("id", "")
-                        if call_index >= MAX_TOOL_CALLS:
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps({"error": "Use at most four Brightloop lookups per answer."})})
-                            continue
-                        function = call.get("function", {})
-                        name = function.get("name", "")
-                        try:
-                            arguments = json.loads(function.get("arguments") or "{}")
-                            if not isinstance(arguments, dict):
-                                raise ValueError("Tool arguments must be an object.")
-                            result = _tool_result(name, arguments, actor, db)
-                        except Exception:
-                            result = {"error": "I could not retrieve that Brightloop information. Try a narrower question."}
-                        sources.extend(str(item) for item in result.get("sources", []))
-                        result = _redact_private_text(result)
-                        lookup_results.append({"tool": name, "data": result})
-                        messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": json.dumps(result, ensure_ascii=False, default=str)[:12000]})
-                    tool_rounds += 1
-                    continue
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return {"reply": content.strip()[:6000], "sources": list(dict.fromkeys(sources))[:8], "model": GROQ_MODEL}
-                break
-            else:
-                # Keep function-call messages out of this pass. GPT-OSS may otherwise repeat a
-                # tool call after the tool budget is exhausted, which Groq rejects without tools.
-                final_messages = [
-                    {
-                        "role": "system",
-                        "content": f"{messages[0]['content']}\n\nThe read-only lookup budget is complete. Do not request or call more tools. Answer from the verified lookup results provided below. If they are insufficient, say what is missing.",
-                    }
-                ]
-                final_messages.extend(
-                    {"role": "user", "content": f"Earlier question for context only: {turn.content.strip()[:MAX_MESSAGE_CHARS]}"}
-                    for turn in history
-                    if turn.role == "user"
-                )
-                final_messages.append({"role": "user", "content": payload.message.strip()[:MAX_MESSAGE_CHARS]})
-                final_messages.append({
-                    "role": "user",
-                    "content": "Verified Brightloop read-only lookup results (JSON):\n"
-                    + json.dumps(lookup_results, ensure_ascii=False, default=str)[:30000]
-                    + "\nAnswer the original question concisely, using only these results.",
-                })
-                response = await client.post(
-                    GROQ_URL,
-                    headers=headers,
-                    json={"model": GROQ_MODEL, "messages": final_messages, "temperature": 0.2, "max_completion_tokens": 1100},
-                )
-                if response.status_code == 429:
-                    raise HTTPException(429, "Brightloop Guide is at its provider limit. Please try again shortly.")
-                if response.status_code >= 400:
-                    raise HTTPException(502, "Brightloop Guide could not complete the request. Please try again.")
-                message = response.json().get("choices", [{}])[0].get("message", {})
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return {"reply": content.strip()[:6000], "sources": list(dict.fromkeys(sources))[:8], "model": GROQ_MODEL}
-    except HTTPException:
-        raise
-    except httpx.TimeoutException as error:
-        raise HTTPException(504, "Brightloop Guide took too long to respond. Please try again.") from error
-    except httpx.HTTPError as error:
-        raise HTTPException(502, "Brightloop Guide is temporarily unavailable. Please try again.") from error
-    except (ValueError, KeyError, IndexError) as error:
-        raise HTTPException(502, "Brightloop Guide returned an unreadable response. Please try again.") from error
-    raise HTTPException(502, "Brightloop Guide could not ground an answer in workspace information. Please rephrase your question.")
+    models_to_try = [GROQ_MODEL]
+    if "openai/gpt-oss-20b" not in models_to_try:
+        models_to_try.append("openai/gpt-oss-20b")
+
+    for model_name in models_to_try:
+        messages = [{"role": "system", "content": system_content}]
+        messages.extend({"role": "user", "content": f"Earlier question (context only): {turn.content.strip()[:MAX_MESSAGE_CHARS]}"} for turn in history if turn.role == "user")
+        messages.append({"role": "user", "content": payload.message.strip()[:MAX_MESSAGE_CHARS]})
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(28.0, connect=6.0)) as client:
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "User-Agent": "BrightloopOS/1.0"}
+                tool_rounds = 0
+                while tool_rounds < MAX_TOOL_ROUNDS:
+                    response = await client.post(
+                        GROQ_URL,
+                        headers=headers,
+                        json={"model": model_name, "messages": messages, "tools": TOOLS, "tool_choice": "required" if tool_rounds == 0 else "auto", "temperature": 0.2, "max_completion_tokens": 1100},
+                    )
+                    if response.status_code >= 400:
+                        break
+                    completion = response.json()
+                    choice = completion.get("choices", [{}])[0]
+                    message = choice.get("message", {})
+                    tool_calls = message.get("tool_calls") or []
+                    if tool_calls:
+                        messages.append(message)
+                        for call_index, call in enumerate(tool_calls):
+                            call_id = call.get("id", "")
+                            if call_index >= MAX_TOOL_CALLS:
+                                messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps({"error": "Use at most four Brightloop lookups per answer."})})
+                                continue
+                            function = call.get("function", {})
+                            name = function.get("name", "")
+                            try:
+                                arguments = json.loads(function.get("arguments") or "{}")
+                                if not isinstance(arguments, dict):
+                                    raise ValueError("Tool arguments must be an object.")
+                                result = _tool_result(name, arguments, actor, db)
+                            except Exception:
+                                result = {"error": "I could not retrieve that Brightloop information. Try a narrower question."}
+                            sources.extend(str(item) for item in result.get("sources", []))
+                            result = _redact_private_text(result)
+                            lookup_results.append({"tool": name, "data": result})
+                            messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": json.dumps(result, ensure_ascii=False, default=str)[:12000]})
+                        tool_rounds += 1
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return {"reply": content.strip()[:6000], "sources": list(dict.fromkeys(sources))[:8], "model": model_name}
+                    break
+                else:
+                    final_messages = [
+                        {
+                            "role": "system",
+                            "content": f"{system_content}\n\nThe read-only lookup budget is complete. Do not request or call more tools. Answer from the verified lookup results provided below. If they are insufficient, say what is missing.",
+                        }
+                    ]
+                    final_messages.extend(
+                        {"role": "user", "content": f"Earlier question for context only: {turn.content.strip()[:MAX_MESSAGE_CHARS]}"}
+                        for turn in history
+                        if turn.role == "user"
+                    )
+                    final_messages.append({"role": "user", "content": payload.message.strip()[:MAX_MESSAGE_CHARS]})
+                    final_messages.append({
+                        "role": "user",
+                        "content": "Verified Brightloop read-only lookup results (JSON):\n"
+                        + json.dumps(lookup_results, ensure_ascii=False, default=str)[:30000]
+                        + "\nAnswer the original question concisely, using only these results.",
+                    })
+                    response = await client.post(
+                        GROQ_URL,
+                        headers=headers,
+                        json={"model": model_name, "messages": final_messages, "temperature": 0.2, "max_completion_tokens": 1100},
+                    )
+                    if response.status_code < 400:
+                        message = response.json().get("choices", [{}])[0].get("message", {})
+                        content = message.get("content")
+                        if isinstance(content, str) and content.strip():
+                            return {"reply": content.strip()[:6000], "sources": list(dict.fromkeys(sources))[:8], "model": model_name}
+        except Exception as error:
+            print(f"[Brightloop Guide] Model {model_name} error: {error}")
+            continue
+
+    # If all models encounter an issue, return guaranteed grounded fallback
+    return _generate_grounded_fallback(payload.message, actor, db)

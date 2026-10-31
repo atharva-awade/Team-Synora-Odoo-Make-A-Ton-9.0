@@ -26,16 +26,21 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
     let observer: ResizeObserver | undefined
     let contextLost = false
     let initializeVersion = 0
+    let mixer: ThreeTypes.AnimationMixer | undefined
 
     const clearCanvas = () => {
       observer?.disconnect()
       observer = undefined
+      if (mixer) {
+        mixer.stopAllAction()
+        mixer = undefined
+      }
       scene?.traverse((object) => {
         const renderable = object as ThreeTypes.Mesh | ThreeTypes.Points | ThreeTypes.LineSegments
         if (renderable.geometry) {
           renderable.geometry.dispose()
           const materials = Array.isArray(renderable.material) ? renderable.material : [renderable.material]
-          materials.forEach((material) => material.dispose())
+          materials.forEach((material) => material?.dispose?.())
         }
       })
       scene = undefined
@@ -56,8 +61,10 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
       if (motionPreference.matches) return
 
       let three: typeof import('three')
+      let gltfLoaderModule: typeof import('three/examples/jsm/loaders/GLTFLoader.js')
       try {
         three = await import('three')
+        gltfLoaderModule = await import('three/examples/jsm/loaders/GLTFLoader.js')
         if (version !== initializeVersion || motionPreference.matches) return
         renderer = new three.WebGLRenderer({ alpha: true, antialias: window.innerWidth > 760, powerPreference: 'low-power' })
       } catch {
@@ -97,26 +104,43 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
       assembly.add(engine, orbitSystem)
       world.add(assembly)
 
-      const coreGeometry = new three.IcosahedronGeometry(1.12, 2)
-      const coreMaterial = new three.MeshPhysicalMaterial({
-        color: 0x7772df,
-        emissive: 0x39358c,
-        emissiveIntensity: 0.28,
-        metalness: 0.28,
-        roughness: 0.27,
-        clearcoat: 0.92,
-        clearcoatRoughness: 0.16,
-        flatShading: false,
-      })
-      const core = new three.Mesh(coreGeometry, coreMaterial)
-      engine.add(core)
+      const dirLight = new three.DirectionalLight(0xffffff, 2.2)
+      dirLight.position.set(3, 4, 5)
+      world.add(dirLight)
 
-      const energyLoop = new three.Mesh(
-        new three.TorusGeometry(0.48, 0.017, 12, 96),
-        new three.MeshStandardMaterial({ color: 0xb6ffe7, emissive: 0x4fd6b1, emissiveIntensity: 0.58, metalness: 0.5, roughness: 0.22, transparent: true, opacity: 0.76 }),
+      const loader = new gltfLoaderModule.GLTFLoader()
+      loader.load(
+        '/floating_fox.glb',
+        (gltf) => {
+          if (version !== initializeVersion) return
+          const model = gltf.scene
+          const box = new three.Box3().setFromObject(model)
+          const size = new three.Vector3()
+          box.getSize(size)
+          const center = new three.Vector3()
+          box.getCenter(center)
+
+          model.position.set(-center.x, -center.y, -center.z)
+
+          const pivot = new three.Group()
+          pivot.add(model)
+          pivot.rotation.y = -0.35
+          const maxDim = Math.max(size.x, size.y, size.z) || 1
+          pivot.scale.setScalar(4.5 / maxDim)
+
+          engine.add(pivot)
+
+          if (gltf.animations && gltf.animations.length > 0) {
+            mixer = new three.AnimationMixer(model)
+            const action = mixer.clipAction(gltf.animations[0])
+            action.play()
+          }
+        },
+        undefined,
+        (error) => {
+          console.warn('Could not load 3D model:', error)
+        }
       )
-      energyLoop.rotation.set(1.08, 0.38, -0.2)
-      engine.add(energyLoop)
 
       const ringMaterials = [
         new three.MeshStandardMaterial({ color: 0xaaa4ff, emissive: 0x6962d4, emissiveIntensity: 0.32, metalness: 0.62, roughness: 0.26, transparent: true, opacity: 0.62 }),
@@ -125,7 +149,7 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
       ]
       const ringRotations: [number, number, number][] = [[1.08, 0.18, -0.34], [0.31, 1.14, 0.58], [0.75, -0.72, 1.18]]
       ringRotations.forEach((rotation, index) => {
-        const ring = new three.Mesh(new three.TorusGeometry(1.68 + index * 0.15, 0.011, 10, 180), ringMaterials[index])
+        const ring = new three.Mesh(new three.TorusGeometry(2.18 + index * 0.22, 0.013, 10, 180), ringMaterials[index])
         ring.rotation.set(...rotation)
         orbitSystem.add(ring)
       })
@@ -168,6 +192,7 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
       resize()
 
       const startedAt = performance.now()
+      let lastTime = performance.now()
       const onContextLost = (event: Event) => {
         event.preventDefault()
         contextLost = true
@@ -178,40 +203,43 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
 
       const render = (now: number) => {
         if (!renderer || contextLost) return
+        const delta = Math.min((now - lastTime) * 0.001, 0.1)
+        lastTime = now
+        if (mixer) mixer.update(delta)
         const seconds = (now - startedAt) * 0.001
         const reduced = motionPreference.matches
         const source = scrollSource.current
         const rect = source?.getBoundingClientRect()
         const scrollable = rect ? Math.max(1, rect.height - window.innerHeight) : 1
-        const progress = rect ? three.MathUtils.clamp((window.innerHeight * 0.34 - rect.top) / scrollable, 0, 1) : 0
+        const progress = rect ? three.MathUtils.clamp((window.innerHeight * 0.25 - rect.top) / scrollable, 0, 1) : 0
         const active = Math.min(chapterColors.length - 1, Math.max(0, activeRef.current))
-        const drift = reduced ? 0 : seconds * 0.1
-        const scrollTurn = progress * Math.PI * 1.4
+        const drift = reduced ? 0 : seconds * 0.08
+        const scrollTurn = progress * Math.PI * 2.6
 
-        assembly.position.y += ((reduced ? 0 : Math.sin(seconds * 0.58) * 0.1) - assembly.position.y) * 0.025
-        assembly.rotation.z += ((reduced ? 0 : Math.sin(seconds * 0.24) * 0.025) - assembly.rotation.z) * 0.025
-        engine.rotation.y += ((reduced ? 0 : drift * 0.28 + scrollTurn * 0.27) - engine.rotation.y) * 0.035
-        engine.rotation.x += ((reduced ? 0.04 : Math.sin(seconds * 0.28) * 0.09 + (progress - 0.5) * 0.17) - engine.rotation.x) * 0.035
-        energyLoop.rotation.y += ((reduced ? 0.2 : seconds * 0.18 + scrollTurn * 0.72) - energyLoop.rotation.y) * 0.035
-        orbitSystem.rotation.y += ((reduced ? 0 : drift * 0.44 + scrollTurn) - orbitSystem.rotation.y) * 0.04
-        orbitSystem.rotation.x += ((reduced ? 0.08 : 0.08 + Math.sin(scrollTurn * 0.7) * 0.11) - orbitSystem.rotation.x) * 0.04
+        const targetAssemblyY = reduced ? 0 : Math.sin(seconds * 0.58) * 0.14 + (progress - 0.5) * -0.38
+        assembly.position.y += (targetAssemblyY - assembly.position.y) * 0.08
+        assembly.rotation.z += ((reduced ? 0 : Math.sin(seconds * 0.24) * 0.035 + (progress - 0.5) * 0.15) - assembly.rotation.z) * 0.08
+        engine.rotation.y += ((reduced ? 0 : drift * 0.2 + scrollTurn * 0.88) - engine.rotation.y) * 0.085
+        engine.rotation.x += ((reduced ? 0.04 : Math.sin(seconds * 0.28) * 0.08 + (progress - 0.5) * 0.48) - engine.rotation.x) * 0.085
+        orbitSystem.rotation.y += ((reduced ? 0 : drift * 0.4 + scrollTurn * 1.15) - orbitSystem.rotation.y) * 0.09
+        orbitSystem.rotation.x += ((reduced ? 0.08 : 0.08 + Math.sin(scrollTurn * 0.6) * 0.22) - orbitSystem.rotation.x) * 0.09
         nodes.forEach((node, index) => {
           const material = node.material as ThreeTypes.MeshStandardMaterial
           const highlighted = index === active
-          const targetScale = highlighted ? 1.42 : 0.78
-          node.scale.x += (targetScale - node.scale.x) * 0.09
+          const targetScale = highlighted ? 1.55 : 0.72
+          node.scale.x += (targetScale - node.scale.x) * 0.18
           node.scale.y = node.scale.x
           node.scale.z = node.scale.x
-          material.emissiveIntensity += ((highlighted ? 1.15 : 0.23) - material.emissiveIntensity) * 0.12
+          material.emissiveIntensity += ((highlighted ? 1.35 : 0.2) - material.emissiveIntensity) * 0.2
         })
 
-        const cameraAngle = progress * Math.PI * 1.15
-        const targetX = reduced ? 0 : Math.sin(cameraAngle) * 0.34
-        const targetY = reduced ? 0.04 : Math.cos(cameraAngle * 0.8) * 0.15
-        const targetZ = 8.1 - Math.sin(progress * Math.PI) * 0.12
-        camera.position.x += (targetX - camera.position.x) * 0.028
-        camera.position.y += (targetY - camera.position.y) * 0.028
-        camera.position.z += (targetZ - camera.position.z) * 0.028
+        const cameraAngle = progress * Math.PI * 1.2
+        const targetX = reduced ? 0 : Math.sin(cameraAngle) * 0.45
+        const targetY = reduced ? 0.04 : Math.cos(cameraAngle * 0.8) * 0.22
+        const targetZ = 8.1 - Math.sin(progress * Math.PI) * 0.35
+        camera.position.x += (targetX - camera.position.x) * 0.065
+        camera.position.y += (targetY - camera.position.y) * 0.065
+        camera.position.z += (targetZ - camera.position.z) * 0.065
         camera.lookAt(0, 0, 0)
 
         renderer.render(world, camera)
@@ -291,6 +319,6 @@ export default function RevenueEngineScene({ activeIndex, scrollSource }: Revenu
 }
 
 const chaptersPositions: [number, number, number][] = [
-  [-1.92, 0.62, 0.08], [-0.75, 1.66, 0.23], [1.25, 1.22, -0.2],
-  [1.88, -0.48, 0.16], [0.08, -1.82, -0.28], [-1.52, -1.12, 0.18],
+  [-2.42, 0.78, 0.1], [-0.98, 2.18, 0.28], [1.68, 1.58, -0.25],
+  [2.48, -0.65, 0.2], [0.12, -2.38, -0.35], [-1.98, -1.48, 0.22],
 ]
