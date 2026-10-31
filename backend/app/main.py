@@ -65,6 +65,36 @@ def startup() -> None:
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         seed_database(db)
+        migrate_currency_copy(db)
+
+
+def migrate_currency_copy(db: Session) -> None:
+    launch_discount = db.scalar(select(DiscountRule).where(DiscountRule.code == "ODOO-LAUNCH-500"))
+    if launch_discount and launch_discount.name == "Odoo Launch $500":
+        launch_discount.name = "Odoo Launch ₹500"
+
+    notices = db.scalars(
+        select(OutboxMessage).where(
+            OutboxMessage.related_type.in_(("INVOICE", "DUNNING")),
+            OutboxMessage.body.contains("$"),
+        )
+    ).all()
+    for notice in notices:
+        notice.body = notice.body.replace("$", "₹")
+
+    payment_events = db.scalars(
+        select(models.AuditEvent).where(models.AuditEvent.action.in_(("PAYMENT_RECORDED", "PAYMENT_CONFIRMED")))
+    ).all()
+    for event in payment_events:
+        if event.action == "PAYMENT_RECORDED":
+            amount_match = re.search(r"(\d+) cents$", event.detail or "")
+            if amount_match:
+                event.detail = f"{event.detail[:amount_match.start()].rstrip()} ₹{int(amount_match.group(1)) / 100:,.2f}"
+        else:
+            amount_match = re.search(r" for (\d+) cents\.$", event.detail or "")
+            if amount_match:
+                event.detail = f"{event.detail[:amount_match.start()]} for ₹{int(amount_match.group(1)) / 100:,.2f}."
+    db.commit()
 
 
 def user_data(user: User) -> dict:
@@ -220,13 +250,13 @@ def _process_dunning(db: Session, today: date) -> int:
             for stage in range(invoice.dunning_stage + 1, next_stage + 1):
                 if stage == 1:
                     subject = f"A friendly reminder: {invoice.number}"
-                    body = f"Invoice {invoice.number} is 3 days past due. The open balance is ${invoice.amount_due_cents / 100:,.2f}. Please review it in your customer portal."
+                    body = f"Invoice {invoice.number} is 3 days past due. The open balance is ₹{invoice.amount_due_cents / 100:,.2f}. Please review it in your customer portal."
                 elif stage == 2:
                     subject = f"Finance follow-up: {invoice.number}"
-                    body = f"Invoice {invoice.number} is 7 days past due. ${invoice.amount_due_cents / 100:,.2f} remains outstanding. Please arrange payment or contact the finance team."
+                    body = f"Invoice {invoice.number} is 7 days past due. ₹{invoice.amount_due_cents / 100:,.2f} remains outstanding. Please arrange payment or contact the finance team."
                 else:
                     subject = f"Service review notice: {invoice.number}"
-                    body = f"Invoice {invoice.number} is 14 or more days past due, with ${invoice.amount_due_cents / 100:,.2f} outstanding. Contact the finance team to avoid a service restriction review."
+                    body = f"Invoice {invoice.number} is 14 or more days past due, with ₹{invoice.amount_due_cents / 100:,.2f} outstanding. Contact the finance team to avoid a service restriction review."
                 enqueue(db, customer.email if customer else "", subject, body, "DUNNING", invoice.id, "http://localhost:5173")
                 record_event(db, None, "INVOICE", invoice.id, "DUNNING_STAGE", str(stage))
                 messages += 1
@@ -694,7 +724,7 @@ def invoice_action(invoice_id: int, payload: dict, actor: User = Depends(get_cur
             raise HTTPException(409, "Only draft invoices can be confirmed.")
         invoice.status = "CONFIRMED"
         customer = db.get(User, invoice.customer_id)
-        enqueue(db, customer.email if customer else "", f"Invoice {invoice.number} is ready", f"Your invoice is confirmed with ${invoice.amount_due_cents / 100:,.2f} due. Review it in your Brightloop portal.", "INVOICE", invoice.id, "http://localhost:5173")
+        enqueue(db, customer.email if customer else "", f"Invoice {invoice.number} is ready", f"Your invoice is confirmed with ₹{invoice.amount_due_cents / 100:,.2f} due. Review it in your Brightloop portal.", "INVOICE", invoice.id, "http://localhost:5173")
     elif action == "CANCEL":
         if actor.role not in ("ADMIN", "STAFF") or invoice.status not in ("DRAFT", "CONFIRMED") or invoice.amount_paid_cents:
             raise HTTPException(409, "Only unpaid draft or confirmed invoices can be cancelled by staff.")
@@ -707,7 +737,7 @@ def invoice_action(invoice_id: int, payload: dict, actor: User = Depends(get_cur
         if actor.role not in ("ADMIN", "STAFF"):
             raise HTTPException(403, "Only staff can send invoices to customers.")
         customer = db.get(User, invoice.customer_id)
-        enqueue(db, customer.email if customer else "", f"Invoice {invoice.number}", f"Your invoice balance is ${invoice.amount_due_cents / 100:,.2f}.", "INVOICE", invoice.id)
+        enqueue(db, customer.email if customer else "", f"Invoice {invoice.number}", f"Your invoice balance is ₹{invoice.amount_due_cents / 100:,.2f}.", "INVOICE", invoice.id)
     elif action != "PRINT":
         raise HTTPException(422, "Supported actions are CONFIRM, CANCEL, SEND, and PRINT.")
     record_event(db, actor.id, "INVOICE", invoice.id, action)
@@ -732,7 +762,7 @@ def record_payment(invoice_id: int, payload: PaymentCreateIn, actor: User = Depe
     invoice.amount_due_cents -= payload.amount_cents
     if invoice.amount_due_cents == 0:
         invoice.status = "PAID"
-    record_event(db, actor.id, "INVOICE", invoice.id, "PAYMENT_RECORDED", f"{payment.reference} {payload.amount_cents} cents")
+    record_event(db, actor.id, "INVOICE", invoice.id, "PAYMENT_RECORDED", f"{payment.reference} ₹{payload.amount_cents / 100:,.2f}")
     db.commit()
     db.refresh(invoice)
     return {"payment": {"id": payment.id, "reference": payment.reference, "amount_cents": payment.amount_cents, "method": payment.method, "payment_date": payment.payment_date.isoformat()}, "invoice": _invoice_data(db, invoice, actor)}
@@ -760,8 +790,8 @@ def _parse_bank_date(value: str) -> date:
 def _ofx_to_csv(content: str) -> str:
     """Normalize OFX 1.x SGML or OFX 2 XML statement transactions to the CSV importer shape."""
     currency = re.search(r"<CURDEF\b[^>]*>\s*([^<\r\n]+)", content, re.IGNORECASE)
-    if currency and currency.group(1).strip().upper() != "USD":
-        raise HTTPException(422, "Brightloop currently reconciles USD bank statements only.")
+    if currency and currency.group(1).strip().upper() != "INR":
+        raise HTTPException(422, "Brightloop currently reconciles INR bank statements only.")
     transactions = re.findall(r"<STMTTRN\b[^>]*>(.*?)(?:</STMTTRN\b[^>]*>|(?=<STMTTRN\b|</BANKTRANLIST\b|</OFX\b))", content, re.IGNORECASE | re.DOTALL)
     if not transactions:
         raise HTTPException(422, "This OFX file has no bank statement transactions.")
@@ -797,13 +827,13 @@ def _parse_bank_amount(row: dict[str, str], amount_header: str) -> int:
     raw = (row.get(amount_header) or "").strip()
     if not raw:
         raise ValueError("Amount is required.")
-    if amount_header.lower().replace("_", "") == "amountcents":
+    if amount_header.lower().replace("_", "") in {"amountcents", "amountpaise"}:
         try:
             cents = int(raw)
         except ValueError as error:
-            raise ValueError("Amount cents must be a whole number.") from error
+            raise ValueError("Amount paise must be a whole number.") from error
     else:
-        normalized = raw.replace("$", "").replace("₹", "").replace(",", "").strip()
+        normalized = re.sub(r"(?i)^(?:INR|RS\.?|₹)\s*", "", raw).replace("₹", "").replace(",", "").strip()
         if normalized.startswith("(") and normalized.endswith(")"):
             normalized = f"-{normalized[1:-1]}"
         try:
@@ -853,9 +883,9 @@ def import_bank_statement(payload: ReconciliationImportIn, actor: User = Depends
     def find_header(*names: str) -> str | None:
         return next((aliases[name] for name in names if name in aliases), None)
     date_header = find_header("date", "transactiondate", "valuedate", "paymentdate")
-    amount_header = find_header("amount", "amountcents", "credit", "deposit")
+    amount_header = find_header("amount", "amountpaise", "amountcents", "credit", "deposit")
     if not date_header or not amount_header:
-        raise HTTPException(422, "CSV headers must include date and amount (or amount_cents). Optional headers: reference, payer, memo, invoice_number.")
+        raise HTTPException(422, "CSV headers must include date and amount (or amount_paise). Optional headers: reference, payer, memo, invoice_number.")
     reference_header = find_header("reference", "transactionid", "transactionreference", "id", "txn")
     payer_header = find_header("payer", "payeremail", "customer", "customeremail", "customername", "counterparty", "counterpartyname", "name", "email")
     memo_header = find_header("memo", "description", "details", "narration", "remittance")
@@ -942,7 +972,7 @@ def confirm_reconciliation(item_id: int, actor: User = Depends(require_roles("AD
     if not invoice or invoice.status != "CONFIRMED" or invoice.amount_due_cents <= 0:
         raise HTTPException(409, "The suggested invoice is no longer open for payment.")
     if item.amount_cents > invoice.amount_due_cents:
-        raise HTTPException(409, f"The bank amount exceeds the invoice's current balance of {invoice.amount_due_cents} cents. Review the match before proceeding.")
+        raise HTTPException(409, f"The bank amount exceeds the invoice's current balance of ₹{invoice.amount_due_cents / 100:,.2f}. Review the match before proceeding.")
     payment = Payment(reference=f"RECON-{item.id:08d}", invoice_id=invoice.id, customer_id=invoice.customer_id, method="BANK_TRANSFER", amount_cents=item.amount_cents, payment_date=item.transaction_date, note=f"Statement {item.bank_reference or 'row'} · {item.memo}".strip(" ·"), created_at=datetime.utcnow())
     db.add(payment)
     invoice.amount_paid_cents += item.amount_cents
@@ -952,7 +982,7 @@ def confirm_reconciliation(item_id: int, actor: User = Depends(require_roles("AD
     db.flush()
     item.payment_id = payment.id
     item.status = "CONFIRMED"
-    record_event(db, actor.id, "RECONCILIATION", item.id, "PAYMENT_CONFIRMED", f"{payment.reference} matched to {invoice.number} for {item.amount_cents} cents.")
+    record_event(db, actor.id, "RECONCILIATION", item.id, "PAYMENT_CONFIRMED", f"{payment.reference} matched to {invoice.number} for ₹{item.amount_cents / 100:,.2f}.")
     db.commit()
     db.refresh(item)
     return _reconciliation_item_data(db, item)
@@ -983,7 +1013,7 @@ def confirm_high_confidence_reconciliation(payload: ReconciliationBatchConfirmIn
         db.flush()
         item.payment_id = payment.id
         item.status = "CONFIRMED"
-        record_event(db, actor.id, "RECONCILIATION", item.id, "PAYMENT_CONFIRMED", f"{payment.reference} matched to {invoice.number} for {item.amount_cents} cents.")
+        record_event(db, actor.id, "RECONCILIATION", item.id, "PAYMENT_CONFIRMED", f"{payment.reference} matched to {invoice.number} for ₹{item.amount_cents / 100:,.2f}.")
         confirmed.append(item)
     if confirmed:
         db.commit()

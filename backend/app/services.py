@@ -237,7 +237,7 @@ def seed_database(db: Session) -> None:
     db.flush()
 
     seat_discount = DiscountRule(code="SEAT-EXPANSION-15", name="Seat Expansion 15%", discount_type="PERCENTAGE", value=1500, scope="SUBSCRIPTION", min_purchase_cents=0, min_quantity=10, start_date=date(2026, 1, 1), end_date=date(2027, 12, 31), max_uses=3)
-    launch_discount = DiscountRule(code="ODOO-LAUNCH-500", name="Odoo Launch $500", discount_type="FIXED", value=50000, scope="PRODUCT", min_purchase_cents=200000, min_quantity=1, start_date=date(2026, 1, 1), end_date=date(2027, 12, 31), max_uses=2)
+    launch_discount = DiscountRule(code="ODOO-LAUNCH-500", name="Odoo Launch ₹500", discount_type="FIXED", value=50000, scope="PRODUCT", min_purchase_cents=200000, min_quantity=1, start_date=date(2026, 1, 1), end_date=date(2027, 12, 31), max_uses=2)
     db.add_all([seat_discount, launch_discount])
     db.flush()
     db.add(DiscountProduct(discount_id=launch_discount.id, product_id=core.id))
